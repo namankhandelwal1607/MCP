@@ -1,15 +1,14 @@
 """
 High-level Gmail client.
 
-Encapsulates all Gmail API read operations.
+Encapsulates Gmail API operations.
 """
+
 from __future__ import annotations
+
 import base64
-
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-
 import logging
+from email.mime.text import MIMEText
 from typing import Any
 
 from googleapiclient.errors import HttpError
@@ -31,39 +30,77 @@ class GmailClient:
     # ============================================================
     # Private Helpers
     # ============================================================
+
     def _create_message(
         self,
-        sender: str,
         to: str,
         subject: str,
         body: str,
-    ):
+        reply_to: str | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> dict[str, str]:
         """
-        Creates a MIME email.
+        Creates a MIME email and encodes it for the Gmail API.
+
+        The From header is intentionally not set.
+        Gmail API sends the message using the authenticated account.
         """
 
-        message = MIMEMultipart()
+        import re
+        from email.mime.multipart import MIMEMultipart
 
-        message["to"] = to
+        is_html = "<html" in body.lower() or "<p" in body.lower() or "<div" in body.lower()
+        has_markdown = "**" in body or ("[" in body and "](" in body)
 
-        message["from"] = sender
+        if is_html or has_markdown:
+            message = MIMEMultipart("alternative")
+            message["To"] = to
+            message["Subject"] = subject
 
-        message["subject"] = subject
+            if is_html:
+                html_body = body
+                plain_body = re.sub(r'<br\s*/?>', '\n', body)
+                plain_body = re.sub(r'</p>', '\n\n', plain_body)
+                plain_body = re.sub(r'<[^>]+>', '', plain_body).strip()
+            else:
+                paras = body.strip().split('\n\n')
+                html_paras = []
+                for p in paras:
+                    p_html = p.replace('\n', '<br>')
+                    p_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', p_html)
+                    p_html = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', p_html)
+                    html_paras.append(f'<p>{p_html}</p>')
+                html_body = '<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.6; color: #222222;">\n' + '\n'.join(html_paras) + '\n</div>'
+                plain_body = body
 
-        message.attach(
-            MIMEText(
-                body,
-                "plain",
-            )
-        )
+            part_plain = MIMEText(plain_body, "plain", "utf-8")
+            part_html = MIMEText(html_body, "html", "utf-8")
+
+            message.attach(part_plain)
+            message.attach(part_html)
+        else:
+            message = MIMEText(body, "plain", "utf-8")
+            message["To"] = to
+            message["Subject"] = subject
+
+        if reply_to:
+            message["Reply-To"] = reply_to
+
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+
+        if references:
+            message["References"] = references
 
         raw = base64.urlsafe_b64encode(
             message.as_bytes()
-        )
+        ).decode("utf-8")
 
         return {
-            "raw": raw.decode()
+            "raw": raw
         }
+
     def _build_query(
         self,
         sender: str | None = None,
@@ -79,7 +116,7 @@ class GmailClient:
         Builds a Gmail search query.
         """
 
-        parts = []
+        parts: list[str] = []
 
         if sender:
             parts.append(f"from:{sender}")
@@ -151,7 +188,6 @@ class GmailClient:
             raise ValueError("limit must be greater than zero.")
 
         try:
-
             response = (
                 self.service.users()
                 .messages()
@@ -168,7 +204,6 @@ class GmailClient:
             results = []
 
             for msg in messages:
-
                 full = self._get_message(msg["id"])
 
                 results.append(
@@ -231,7 +266,6 @@ class GmailClient:
 
         body = parsed.get("body", "")
 
-        # Protect LLM context window
         if len(body) > 4000:
             body = body[:4000] + "\n\n...[truncated]..."
 
@@ -253,6 +287,7 @@ class GmailClient:
             .get(
                 userId="me",
                 id=thread_id,
+                format="full",
             )
             .execute()
         )
@@ -260,7 +295,6 @@ class GmailClient:
         emails = []
 
         for message in thread.get("messages", []):
-
             emails.append(
                 self._parse_summary(message)
             )
@@ -269,7 +303,7 @@ class GmailClient:
 
     def get_profile(self) -> dict[str, Any]:
         """
-        Gmail profile.
+        Returns the authenticated Gmail profile.
         """
 
         return (
@@ -333,23 +367,22 @@ class GmailClient:
         email_id: str,
     ):
         return self.read_email(email_id)
-    
+
+    # ============================================================
+    # Send Email
+    # ============================================================
+
     def send_email(
         self,
         to: str,
         subject: str,
         body: str,
-    ):
+    ) -> dict[str, Any]:
         """
-        Sends an email.
+        Sends an email using the authenticated Gmail account.
         """
-
-        profile = self.get_profile()
-
-        sender = profile["emailAddress"]
 
         message = self._create_message(
-            sender=sender,
             to=to,
             subject=subject,
             body=body,
@@ -364,26 +397,25 @@ class GmailClient:
             )
             .execute()
         )
-    
+
+    # ============================================================
+    # Draft
+    # ============================================================
+
     def create_draft(
         self,
         to: str,
         subject: str,
         body: str,
-    ):
+    ) -> dict[str, Any]:
         """
         Creates a Gmail draft.
         """
 
-        profile = self.get_profile()
-
-        sender = profile["emailAddress"]
-
         message = self._create_message(
-            sender,
-            to,
-            subject,
-            body,
+            to=to,
+            subject=subject,
+            body=body,
         )
 
         return (
@@ -397,27 +429,29 @@ class GmailClient:
             )
             .execute()
         )
-    
+
+    # ============================================================
+    # Reply
+    # ============================================================
+
     def reply_email(
         self,
         thread_id: str,
         to: str,
         subject: str,
         body: str,
-    ):
+    ) -> dict[str, Any]:
         """
-        Reply to an email thread.
+        Replies to an existing Gmail thread.
+
+        threadId is supplied to Gmail so the message belongs
+        to the existing conversation.
         """
-
-        profile = self.get_profile()
-
-        sender = profile["emailAddress"]
 
         message = self._create_message(
-            sender,
-            to,
-            subject,
-            body,
+            to=to,
+            subject=subject,
+            body=body,
         )
 
         message["threadId"] = thread_id
